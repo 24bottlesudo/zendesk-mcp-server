@@ -54,6 +54,15 @@ curl -s http://localhost:3000/.well-known/oauth-authorization-server
 curl -s -i http://localhost:3000/healthz   # → 200 OK
 ```
 
+## OAuth proxy routes (`/authorize`, `/token`)
+
+Zendesk publishes no RFC 8414 metadata of its own. A client that follows `authorization_servers` to Zendesk therefore finds nothing, and falls back to the MCP spec's default endpoints on **this** server: `/authorize` and `/token`. The server answers both so that fallback reaches Zendesk:
+
+- `GET /authorize` replies `302` to `https://<subdomain>.zendesk.com/oauth/authorizations/new`, keeping the query string (client id, redirect URI, PKCE challenge, state, scope).
+- `POST /token` forwards the form-encoded body to `https://<subdomain>.zendesk.com/oauth/tokens` and relays Zendesk's status and body (`Cache-Control: no-store`). `502` with an OAuth `server_error` if Zendesk is unreachable.
+
+Both drop the RFC 8707 `resource` parameter, which Zendesk does not understand. The server never stores or logs credentials, codes or tokens: it only relays the client's own PKCE exchange. Register the redirect URL your client actually sends in the Zendesk OAuth client (claude.ai sends `https://claude.ai/api/mcp/auth_callback`; the browser shows it in the failing `/authorize` URL if it is missing).
+
 ## MCP client wiring
 
 Every major MCP client supports remote servers over Streamable HTTP and handles the OAuth 2.1 PKCE discovery flow natively — paste the URL, sign in once, you're connected. Replace `https://mcp.example.com` below with your deployed origin.

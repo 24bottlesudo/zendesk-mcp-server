@@ -251,19 +251,21 @@ interface Session {
 // so a client can't stream an unbounded body into server memory.
 export const MAX_BODY_BYTES = 4 * 1024 * 1024;
 
-type BodyResult =
-  | { ok: true; value: unknown }
-  | { ok: false; status: number; rpcCode: number; message: string };
+type BodyFailure = { ok: false; status: number; rpcCode: number; message: string };
 
-// Read and parse the request body. The SDK transport could parse the stream
-// itself, but it neither caps the body size nor maps parse failures to the
-// right HTTP status — buffering here keeps both concerns in one place.
-const readJsonBody = (req: IncomingMessage, maxBodyBytes: number): Promise<BodyResult> =>
+type BodyResult = { ok: true; value: unknown } | BodyFailure;
+
+type RawBodyResult = { ok: true; raw: string } | BodyFailure;
+
+// Buffer the request body up to a byte cap. The SDK transport could read the
+// stream itself, but it neither caps the body size nor maps read failures to
+// the right HTTP status — buffering here keeps both concerns in one place.
+const readRawBody = (req: IncomingMessage, maxBodyBytes: number): Promise<RawBodyResult> =>
   new Promise((resolve) => {
     const chunks: Buffer[] = [];
     let total = 0;
     let settled = false;
-    const settle = (result: BodyResult): void => {
+    const settle = (result: RawBodyResult): void => {
       if (settled) return;
       settled = true;
       resolve(result);
@@ -282,23 +284,7 @@ const readJsonBody = (req: IncomingMessage, maxBodyBytes: number): Promise<BodyR
       }
       chunks.push(chunk);
     });
-    req.on('end', () => {
-      const raw = Buffer.concat(chunks).toString('utf8');
-      if (!raw) {
-        settle({ ok: true, value: undefined });
-        return;
-      }
-      try {
-        settle({ ok: true, value: JSON.parse(raw) });
-      } catch {
-        settle({
-          ok: false,
-          status: 400,
-          rpcCode: -32700,
-          message: 'Parse error: request body is not valid JSON.',
-        });
-      }
-    });
+    req.on('end', () => settle({ ok: true, raw: Buffer.concat(chunks).toString('utf8') }));
     req.on('error', () =>
       settle({
         ok: false,
@@ -308,6 +294,105 @@ const readJsonBody = (req: IncomingMessage, maxBodyBytes: number): Promise<BodyR
       }),
     );
   });
+
+// Read and parse a JSON request body (an empty body yields `undefined`).
+const readJsonBody = async (req: IncomingMessage, maxBodyBytes: number): Promise<BodyResult> => {
+  const body = await readRawBody(req, maxBodyBytes);
+  if (!body.ok) return body;
+  if (!body.raw) return { ok: true, value: undefined };
+  try {
+    return { ok: true, value: JSON.parse(body.raw) };
+  } catch {
+    return {
+      ok: false,
+      status: 400,
+      rpcCode: -32700,
+      message: 'Parse error: request body is not valid JSON.',
+    };
+  }
+};
+
+// --- OAuth proxy routes ----------------------------------------------------
+//
+// Zendesk publishes no RFC 8414 metadata of its own, so an MCP client that
+// follows `authorization_servers` to Zendesk finds nothing and falls back to
+// the MCP spec's default endpoints, relative to this server: `/authorize` and
+// `/token`. These two routes bridge that fallback to the real Zendesk
+// endpoints. They never see or store credentials: /authorize is a plain
+// redirect, /token forwards the client's own PKCE exchange and relays the
+// answer. Zendesk does not understand the RFC 8707 `resource` parameter, so it
+// is dropped on the way through.
+
+// OAuth token requests are a handful of short form fields; anything larger is
+// not a legitimate request.
+const OAUTH_BODY_MAX_BYTES = 64 * 1024;
+
+const OAUTH_UPSTREAM_TIMEOUT_MS = 15_000;
+
+const withoutResourceParam = (params: URLSearchParams): URLSearchParams => {
+  const copy = new URLSearchParams(params);
+  copy.delete('resource');
+  return copy;
+};
+
+const sendMethodNotAllowed = (res: ServerResponse, allow: string): void => {
+  res.writeHead(405, { 'Content-Type': 'application/json', Allow: allow });
+  res.end(JSON.stringify({ error: 'method_not_allowed', allow }));
+};
+
+const handleAuthorize = (config: Config, url: URL, res: ServerResponse): void => {
+  const target = new URL(getOAuthUrls(config.subdomain).authorizeUrl);
+  target.search = withoutResourceParam(url.searchParams).toString();
+  res.writeHead(302, { Location: target.toString(), 'Cache-Control': 'no-store' });
+  res.end();
+};
+
+const handleToken = async (
+  config: Config,
+  req: IncomingMessage,
+  res: ServerResponse,
+  logger: Logger,
+): Promise<void> => {
+  const body = await readRawBody(req, OAUTH_BODY_MAX_BYTES);
+  if (!body.ok) {
+    respondBodyError(req, res, body);
+    return;
+  }
+
+  let upstream: Response;
+  try {
+    upstream = await fetch(getOAuthUrls(config.subdomain).tokenUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        Accept: 'application/json',
+      },
+      body: withoutResourceParam(new URLSearchParams(body.raw)).toString(),
+      redirect: 'error',
+      signal: AbortSignal.timeout(OAUTH_UPSTREAM_TIMEOUT_MS),
+    });
+  } catch (err) {
+    // Never log the request body or the error message: either may carry
+    // an authorization code, a code verifier or a refresh token.
+    logger.warn('oauth_token_proxy_failed', {
+      error: err instanceof Error ? err.name : 'unknown',
+    });
+    sendJson(res, 502, {
+      error: 'server_error',
+      error_description: 'Could not reach the Zendesk token endpoint.',
+    });
+    return;
+  }
+
+  const text = await upstream.text();
+  res.writeHead(upstream.status, {
+    'Content-Type': upstream.headers.get('content-type') ?? 'application/json',
+    // RFC 6749 section 5.1: token responses must not be cached.
+    'Cache-Control': 'no-store',
+    Pragma: 'no-cache',
+  });
+  res.end(text);
+};
 
 const respondBodyError = (
   req: IncomingMessage,
@@ -460,6 +545,18 @@ export const startHttpTransport = async (
         sendJson(res, 200, { status: 'ok', subdomain: config.subdomain });
         return;
       }
+      if (url.pathname === '/authorize') {
+        if (req.method === 'GET') handleAuthorize(config, url, res);
+        else sendMethodNotAllowed(res, 'GET');
+        return;
+      }
+
+      if (url.pathname === '/token') {
+        if (req.method === 'POST') await handleToken(config, req, res, logger);
+        else sendMethodNotAllowed(res, 'POST');
+        return;
+      }
+
       if (url.pathname === '/mcp') {
         await handleMcpRequest(req, res);
         return;
